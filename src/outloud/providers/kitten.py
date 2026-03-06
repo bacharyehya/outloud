@@ -1,0 +1,101 @@
+"""KittenTTS provider — local, free, no API key needed."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+
+from . import AudioResult, CostEstimate, TTSProvider, Voice
+
+VOICES = [
+    Voice("Bella", "Bella", "female"), Voice("Jasper", "Jasper", "male"),
+    Voice("Luna", "Luna", "female"), Voice("Bruno", "Bruno", "male"),
+    Voice("Rosie", "Rosie", "female"), Voice("Hugo", "Hugo", "male"),
+    Voice("Kiki", "Kiki", "female"), Voice("Leo", "Leo", "male"),
+]
+
+MODELS = {
+    "mini": "KittenML/kitten-tts-mini-0.8",
+    "micro": "KittenML/kitten-tts-micro-0.8",
+    "nano": "KittenML/kitten-tts-nano-0.8-int8",
+}
+
+
+class KittenProvider(TTSProvider):
+    name = "Local"
+    requires_api_key = False
+
+    def __init__(self, model: str = "mini"):
+        # Import at init time — if kittentts isn't installed, this raises ImportError
+        # which ProviderManager catches gracefully
+        import kittentts  # noqa: F401
+        self._model_id = MODELS.get(model, MODELS["mini"])
+        self._tts = None
+
+    def _get_tts(self):
+        if self._tts is None:
+            from kittentts import KittenTTS
+            self._tts = KittenTTS(model_name=self._model_id)
+        return self._tts
+
+    def is_available(self) -> bool:
+        try:
+            import kittentts  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def voices(self) -> list[Voice]:
+        return VOICES
+
+    def styles(self) -> dict[str, str]:
+        return {"Default": ""}
+
+    def default_voice(self) -> str:
+        return "Bella"
+
+    def estimate_cost(self, text: str) -> CostEstimate:
+        # KittenTTS chunks at 400 chars
+        chunks = max(1, (len(text) + 399) // 400)
+        return CostEstimate(provider=self.name, chars=len(text), chunks=chunks, estimated_usd=0.0)
+
+    async def generate(self, text, voice="Bella", style="", speed=1.0, output_dir=None, on_progress=None):
+        output_dir = output_dir or os.path.expanduser("~/Downloads")
+        os.makedirs(output_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        out_file = os.path.join(output_dir, f"outloud_{ts}.wav")
+
+        tts = self._get_tts()
+        chunks = max(1, (len(text) + 399) // 400)
+
+        # KittenTTS is sync — run in thread to not block the event loop
+        def _generate():
+            tts.generate_to_file(
+                text, out_file, voice=voice, speed=speed,
+                sample_rate=24000, clean_text=True,
+            )
+
+        await asyncio.to_thread(_generate)
+
+        if on_progress:
+            on_progress(chunks - 1, chunks, True)
+
+        if not os.path.isfile(out_file):
+            return None
+
+        return AudioResult(
+            path=out_file, size_kb=os.path.getsize(out_file) // 1024,
+            duration_s=self._get_duration(out_file), chunks=chunks,
+            provider=self.name, voice=voice,
+        )
+
+    def _get_duration(self, path: str) -> int:
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                capture_output=True, text=True)
+            return int(float(r.stdout.strip() or "0"))
+        except Exception:
+            return 0

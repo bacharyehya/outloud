@@ -3,14 +3,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "readthis-tts"
-version = "0.1.0"
-description = "Beautiful TUI for text-to-speech via Google Gemini"
+name = "outloud-tts"
+version = "0.2.0"
+description = "Beautiful TUI for text-to-speech. Gemini, OpenAI, or local. One command."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "Bash", email = "bacharyehya@gmail.com" }]
-keywords = ["tts", "text-to-speech", "gemini", "tui", "terminal"]
+keywords = ["tts", "text-to-speech", "gemini", "openai", "tui", "terminal", "kittentts"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -23,12 +23,21 @@ dependencies = [
     "textual>=1.0",
 ]
 
+[project.optional-dependencies]
+local = [
+    "kittentts>=0.8",
+    "onnxruntime",
+    "numpy",
+    "soundfile",
+]
+
 [project.scripts]
-readthis = "readthis.cli:main"
+outloud = "outloud.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/readthis"]
+packages = ["src/outloud"]
 
 [project.urls]
-Homepage = "https://github.com/bacharyehya/readthis"
-Repository = "https://github.com/bacharyehya/readthis"
+Homepage = "https://github.com/bacharyehya/outloud"
+Repository = "https://github.com/bacharyehya/outloud"
+"Buy Me a Coffee" = "https://buymeacoffee.com/bash"
