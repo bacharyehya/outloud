@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from textual import work
@@ -25,6 +26,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
+from .audio import play_audio
 from .config import Config
 from .providers import ProviderManager, TTSProvider
 
@@ -235,7 +237,7 @@ class OutloudApp(App):
         with Vertical(id="main-panel"):
             yield TextArea(self._initial_text, id="text-input", language=None, show_line_numbers=False)
             with Horizontal(id="controls-row-1"):
-                yield Select([], value=None, id="style-select", allow_blank=False)
+                yield Select([("Default", "Default")], value="Default", id="style-select", allow_blank=False)
                 yield Static("", id="cost-label")
             with Horizontal(id="controls-row-2"):
                 yield Button("Generate", variant="success", id="btn-generate")
@@ -402,21 +404,26 @@ class OutloudApp(App):
         if event.option_list.id == "history-list":
             path = event.option.id
             if path and os.path.isfile(path):
-                subprocess.Popen(["afplay", path])
+                play_audio(path)
                 self._set_status(f"Playing: {Path(path).name}")
 
     def action_play_last(self) -> None:
         if self._history:
             last = self._history[-1]
             if os.path.isfile(last.path):
-                subprocess.Popen(["afplay", last.path])
+                play_audio(last.path)
                 self._set_status(f"Playing: {Path(last.path).name}")
         else:
             self._set_status("No audio generated yet.")
 
     def action_open_downloads(self) -> None:
         downloads = os.path.expanduser(self._config.output_dir)
-        subprocess.Popen(["open", downloads])
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", downloads])
+        elif sys.platform == "win32":
+            subprocess.Popen(["explorer", downloads])
+        else:
+            subprocess.Popen(["xdg-open", downloads])
 
     def action_clear_text(self) -> None:
         ta = self.query_one("#text-input", TextArea)

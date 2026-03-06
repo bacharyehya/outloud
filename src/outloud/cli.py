@@ -68,10 +68,11 @@ def main():
     args = parser.parse_args()
 
     if args.support:
+        import webbrowser
         print(f"Thanks for considering supporting outloud!")
         print(f"Buy me a coffee: {COFFEE_URL}")
         print(f"Star on GitHub: {REPO_URL}")
-        subprocess.Popen(["open", COFFEE_URL])
+        webbrowser.open(COFFEE_URL)
         sys.exit(0)
 
     manager = ProviderManager()
@@ -142,7 +143,10 @@ def main():
         print(f"Saved: {result.path} ({result.size_kb:,}KB, {mins}m{secs:02d}s)")
 
         if args.play:
-            subprocess.run(["afplay", result.path])
+            from .audio import play_audio
+            proc = play_audio(result.path)
+            if proc:
+                proc.wait()
         return
 
     # Default: TUI mode

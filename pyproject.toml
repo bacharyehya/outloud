@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "outloud-tts"
-version = "0.2.0"
+version = "0.2.1"
 description = "Beautiful TUI for text-to-speech. Gemini, OpenAI, or local. One command."
 readme = "README.md"
 license = "MIT"
