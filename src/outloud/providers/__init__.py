@@ -39,6 +39,7 @@ class AudioResult:
     provider: str
     voice: str
     elapsed_s: float
+    actual_cost: float | None = None  # real cost from API usage metadata
 
 
 class TTSProvider(ABC):

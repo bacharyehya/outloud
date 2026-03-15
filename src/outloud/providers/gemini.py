@@ -8,6 +8,7 @@ import os
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 
 import aiohttp
 
@@ -59,8 +60,16 @@ def _pcm_to_wav(pcm_path: str, wav_path: str):
         raise RuntimeError(f"PCM→WAV failed: {result.stderr.decode()[-200:]}")
 
 
+@dataclass
+class _ChunkResult:
+    ok: bool
+    error: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
 async def _tts_chunk(session, semaphore, api_key, text, out_path, voice, model, style="", max_retries=6):
-    """Generate a single TTS chunk. Returns (success: bool, error: str)."""
+    """Generate a single TTS chunk. Returns _ChunkResult with token usage."""
     import random
 
     if style:
@@ -88,14 +97,20 @@ async def _tts_chunk(session, semaphore, api_key, text, out_path, voice, model, 
                         last_error = f"server error {resp.status}"
                     elif resp.status != 200:
                         body = await resp.text()
-                        return False, f"HTTP {resp.status}: {body[:150]}"
+                        return _ChunkResult(ok=False, error=f"HTTP {resp.status}: {body[:150]}")
                     else:
                         data = await resp.json()
                         b64 = (data.get("candidates", [{}])[0]
                                .get("content", {}).get("parts", [{}])[0]
                                .get("inlineData", {}).get("data"))
                         if not b64:
-                            return False, "empty audio data in response"
+                            return _ChunkResult(ok=False, error="empty audio data in response")
+
+                        # Extract real token usage
+                        usage = data.get("usageMetadata", {})
+                        in_tok = usage.get("promptTokenCount", 0)
+                        out_tok = usage.get("candidatesTokenCount", 0) or usage.get("totalTokenCount", 0) - in_tok
+
                         pcm_path = out_path + ".pcm"
                         with open(pcm_path, "wb") as f:
                             f.write(base64.b64decode(b64))
@@ -106,19 +121,18 @@ async def _tts_chunk(session, semaphore, api_key, text, out_path, voice, model, 
                                 os.remove(pcm_path)
                             except FileNotFoundError:
                                 pass
-                        return True, ""
+                        return _ChunkResult(ok=True, input_tokens=in_tok, output_tokens=out_tok)
             except asyncio.TimeoutError:
                 last_error = f"timeout ({REQUEST_TIMEOUT}s)"
             except aiohttp.ClientError as e:
                 last_error = f"connection error: {e}"
             except Exception as e:
-                return False, f"unexpected: {e}"
+                return _ChunkResult(ok=False, error=f"unexpected: {e}")
         if attempt < max_retries:
-            # Exponential backoff with jitter — 429s need patience
             base_delay = min(2.0 ** attempt, 15.0)
             jitter = random.uniform(0, base_delay * 0.5)
             await asyncio.sleep(base_delay + jitter)
-    return False, f"failed after {max_retries} retries: {last_error}"
+    return _ChunkResult(ok=False, error=f"failed after {max_retries} retries: {last_error}")
 
 
 class GeminiProvider(TTSProvider):
@@ -155,6 +169,13 @@ class GeminiProvider(TTSProvider):
                 output_tokens / 1_000_000 * pricing["output_per_m"])
         return CostEstimate(provider=self.name, chars=len(text), chunks=len(chunks), estimated_usd=cost)
 
+    def _calc_actual_cost(self, total_input: int, total_output: int) -> float | None:
+        if total_input == 0 and total_output == 0:
+            return None
+        pricing = MODELS.get(self.model, MODELS[DEFAULT_MODEL])
+        return (total_input / 1_000_000 * pricing["input_per_m"] +
+                total_output / 1_000_000 * pricing["output_per_m"])
+
     async def generate(self, text, voice="Fenrir", style="", speed=None, output_dir=None, on_progress=None):
         api_key = self._api_key()
         if not api_key:
@@ -169,13 +190,17 @@ class GeminiProvider(TTSProvider):
         out_file = os.path.join(output_dir, f"outloud_{ts}.wav")
         semaphore = asyncio.Semaphore(MAX_CONCURRENT)
         failed_count = 0
+        total_input_tokens = 0
+        total_output_tokens = 0
 
         if total == 1:
             async with aiohttp.ClientSession() as session:
-                ok, err = await _tts_chunk(session, semaphore, api_key, chunks[0], out_file, voice, self.model, style=style)
+                cr = await _tts_chunk(session, semaphore, api_key, chunks[0], out_file, voice, self.model, style=style)
+                total_input_tokens += cr.input_tokens
+                total_output_tokens += cr.output_tokens
                 if on_progress:
-                    on_progress(0, 1, ok, err)
-                if not ok:
+                    on_progress(0, 1, cr.ok, cr.error)
+                if not cr.ok:
                     return None
         else:
             tmpdir = tempfile.mkdtemp()
@@ -187,8 +212,14 @@ class GeminiProvider(TTSProvider):
                         tasks.append(self._gen_with_progress(session, semaphore, api_key, chunk, path, voice, i, total, on_progress, style=style, delay=i * 0.15))
                     results = await asyncio.gather(*tasks)
 
-                ok_files = [f for f, (ok, _) in zip(chunk_files, results) if ok and os.path.isfile(f)]
-                failed_count = sum(1 for _, (ok, _) in zip(chunk_files, results) if not ok)
+                ok_files = []
+                for f, cr in zip(chunk_files, results):
+                    total_input_tokens += cr.input_tokens
+                    total_output_tokens += cr.output_tokens
+                    if cr.ok and os.path.isfile(f):
+                        ok_files.append(f)
+                    elif not cr.ok:
+                        failed_count += 1
 
                 if not ok_files:
                     return None
@@ -217,12 +248,13 @@ class GeminiProvider(TTSProvider):
             duration_s=get_duration(out_file), chunks=total,
             chunks_failed=failed_count,
             provider=self.name, voice=voice, elapsed_s=round(elapsed, 1),
+            actual_cost=self._calc_actual_cost(total_input_tokens, total_output_tokens),
         )
 
     async def _gen_with_progress(self, session, semaphore, api_key, chunk, path, voice, idx, total, on_progress, style="", delay=0):
         if delay > 0:
             await asyncio.sleep(delay)
-        ok, err = await _tts_chunk(session, semaphore, api_key, chunk, path, voice, self.model, style=style)
+        cr = await _tts_chunk(session, semaphore, api_key, chunk, path, voice, self.model, style=style)
         if on_progress:
-            on_progress(idx, total, ok, err)
-        return ok, err
+            on_progress(idx, total, cr.ok, cr.error)
+        return cr

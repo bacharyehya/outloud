@@ -305,7 +305,8 @@ def main():
 
         mins, secs = divmod(result.duration_s, 60)
         fail_str = f", {result.chunks_failed} failed" if result.chunks_failed else ""
-        print(f"Saved: {result.path} ({result.size_kb:,}KB, {mins}m{secs:02d}s, {result.elapsed_s}s elapsed{fail_str})")
+        cost_str = f", actual cost: ${result.actual_cost:.4f}" if result.actual_cost is not None else ""
+        print(f"Saved: {result.path} ({result.size_kb:,}KB, {mins}m{secs:02d}s, {result.elapsed_s}s elapsed{fail_str}{cost_str})")
 
         if args.play:
             from .audio import play_audio

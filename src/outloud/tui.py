@@ -435,9 +435,10 @@ class OutloudApp(App):
 
         mins, secs = divmod(result.duration_s, 60)
         fail_str = f", {result.chunks_failed} failed" if result.chunks_failed else ""
+        cost_str = f", cost: ${result.actual_cost:.4f}" if result.actual_cost is not None else ""
         self._set_status(
             f"Done in {result.elapsed_s}s! {result.size_kb:,}KB, {mins}m{secs:02d}s audio, "
-            f"{result.chunks} chunks{fail_str} via {result.provider} — {result.path}"
+            f"{result.chunks} chunks{fail_str}{cost_str} via {result.provider} — {result.path}"
         )
 
         history = self.query_one("#history-list", OptionList)
