@@ -30,13 +30,14 @@ class KittenProvider(TTSProvider):
         # Import at init time — if kittentts isn't installed, this raises ImportError
         # which ProviderManager catches gracefully
         import kittentts  # noqa: F401
+        import soundfile  # noqa: F401
         self._model_id = MODELS.get(model, MODELS["mini"])
         self._tts = None
 
     def _get_tts(self):
         if self._tts is None:
             from kittentts import KittenTTS
-            self._tts = KittenTTS(model_name=self._model_id)
+            self._tts = KittenTTS(self._model_id)
         return self._tts
 
     def is_available(self) -> bool:
@@ -71,10 +72,9 @@ class KittenProvider(TTSProvider):
 
         # KittenTTS is sync — run in thread to not block the event loop
         def _generate():
-            tts.generate_to_file(
-                text, out_file, voice=voice, speed=speed,
-                sample_rate=24000, clean_text=True,
-            )
+            import soundfile as sf
+            audio = tts.generate(text, voice=voice)
+            sf.write(out_file, audio, 24000)
 
         await asyncio.to_thread(_generate)
 

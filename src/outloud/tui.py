@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 from textual import work
@@ -29,6 +31,7 @@ from textual.widgets.option_list import Option
 from .audio import play_audio
 from .config import Config
 from .providers import ProviderManager, TTSProvider
+from .stt import record_from_mic_managed, validate_recording, transcribe_mlx, transcribe_openai
 
 
 REPO_URL = "https://github.com/bacharyehya/outloud"
@@ -208,6 +211,27 @@ class OutloudApp(App):
     Button {
         margin-right: 1;
     }
+
+    #btn-record.recording {
+        background: $error;
+        color: $text;
+    }
+
+    #recording-timer {
+        display: none;
+        margin-left: 1;
+        color: $error;
+        content-align-vertical: middle;
+    }
+
+    #recording-timer.visible {
+        display: block;
+    }
+
+    #stt-provider-select {
+        width: 20;
+        margin-left: 2;
+    }
     """
 
     TITLE = "outloud"
@@ -215,6 +239,7 @@ class OutloudApp(App):
 
     BINDINGS = [
         Binding("ctrl+g", "generate", "Generate", show=True),
+        Binding("ctrl+r", "toggle_record", "Record", show=True),
         Binding("ctrl+p", "play_last", "Play Last", show=True),
         Binding("ctrl+o", "open_downloads", "Open Folder", show=True),
         Binding("ctrl+l", "clear_text", "Clear", show=True),
@@ -230,6 +255,13 @@ class OutloudApp(App):
         self._generating = False
         self._chunks_done = 0
         self._chunks_total = 0
+        # STT state
+        self._recording = False
+        self._recording_proc: subprocess.Popen | None = None
+        self._recording_path: str = ""
+        self._recording_start: float = 0.0
+        self._recording_timer = None
+        self._transcribing = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -241,9 +273,14 @@ class OutloudApp(App):
                 yield Static("", id="cost-label")
             with Horizontal(id="controls-row-2"):
                 yield Button("Generate", variant="success", id="btn-generate")
+                yield Button("Record", variant="default", id="btn-record")
                 yield Button("Play Last", variant="primary", id="btn-play")
                 yield Button("Open Folder", variant="warning", id="btn-open")
                 yield Button("Clear", variant="error", id="btn-clear")
+                yield Static("", id="recording-timer")
+                stt_options = [("MLX (local)", "mlx"), ("OpenAI", "openai")]
+                stt_default = self._config.stt_provider if self._config.stt_provider in ("mlx", "openai") else "mlx"
+                yield Select(stt_options, value=stt_default, id="stt-provider-select", allow_blank=False)
             yield Static("", id="star-banner")
             with Vertical(id="status-bar"):
                 yield Static("Ready. Paste text above and hit Generate (Ctrl+G).", id="status-text")
@@ -298,6 +335,7 @@ class OutloudApp(App):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
             "btn-generate": self.action_generate,
+            "btn-record": self.action_toggle_record,
             "btn-play": self.action_play_last,
             "btn-open": self.action_open_downloads,
             "btn-clear": self.action_clear_text,
@@ -406,6 +444,152 @@ class OutloudApp(App):
             if path and os.path.isfile(path):
                 play_audio(path)
                 self._set_status(f"Playing: {Path(path).name}")
+
+    # --- STT Recording ---
+
+    def action_toggle_record(self) -> None:
+        if self._transcribing:
+            self._set_status("Transcription in progress, please wait...")
+            return
+        if self._recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _start_recording(self) -> None:
+        if self._generating:
+            self._set_status("Stop generation before recording.")
+            return
+        self._recording_path = tempfile.mktemp(suffix=".wav", prefix="outloud_rec_")
+        try:
+            self._recording_proc = record_from_mic_managed(self._recording_path)
+        except Exception as e:
+            self._set_status(f"Recording failed: {e}")
+            return
+
+        self._recording = True
+        self._recording_start = time.monotonic()
+
+        btn = self.query_one("#btn-record", Button)
+        btn.label = "Stop"
+        btn.add_class("recording")
+        self.query_one("#btn-generate", Button).disabled = True
+
+        timer_label = self.query_one("#recording-timer", Static)
+        timer_label.update("● 00:00")
+        timer_label.add_class("visible")
+
+        self._recording_timer = self.set_interval(0.5, self._update_recording_timer)
+        self.sub_title = "Recording..."
+        self._set_status("Recording... Press Ctrl+R or Stop to finish.")
+
+    def _update_recording_timer(self) -> None:
+        elapsed = time.monotonic() - self._recording_start
+        mins, secs = divmod(int(elapsed), 60)
+        # Pulsing dot: alternate between ● and ○ every 0.5s
+        dot = "●" if int(elapsed * 2) % 2 == 0 else "○"
+        self.query_one("#recording-timer", Static).update(f"{dot} {mins:02d}:{secs:02d}")
+
+    def _stop_recording(self) -> None:
+        if self._recording_timer:
+            self._recording_timer.stop()
+            self._recording_timer = None
+
+        if self._recording_proc:
+            self._recording_proc.terminate()
+            try:
+                self._recording_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._recording_proc.kill()
+                self._recording_proc.wait()
+            self._recording_proc = None
+
+        self._recording = False
+
+        btn = self.query_one("#btn-record", Button)
+        btn.label = "Record"
+        btn.remove_class("recording")
+
+        timer_label = self.query_one("#recording-timer", Static)
+        timer_label.remove_class("visible")
+
+        if not validate_recording(self._recording_path):
+            self._set_status("Recording too short or empty. Try again.")
+            self.query_one("#btn-generate", Button).disabled = False
+            self.sub_title = "Text-to-Speech"
+            return
+
+        elapsed = time.monotonic() - self._recording_start
+        self._set_status(f"Recorded {int(elapsed)}s. Transcribing...")
+        self.sub_title = "Transcribing..."
+        self._do_transcribe()
+
+    @work(thread=True)
+    def _do_transcribe(self) -> None:
+        import asyncio
+
+        self._transcribing = True
+        self.call_from_thread(self._show_transcribe_progress)
+
+        stt_provider = self.app.query_one("#stt-provider-select", Select).value
+        path = self._recording_path
+        language = self._config.stt_language or None
+
+        try:
+            if stt_provider == "openai":
+                loop = asyncio.new_event_loop()
+                try:
+                    result = loop.run_until_complete(transcribe_openai(path, language=language))
+                finally:
+                    loop.close()
+            else:
+                result = transcribe_mlx(
+                    path,
+                    model=self._config.whisper_model,
+                    language=language,
+                )
+            self.call_from_thread(self._transcription_done, result)
+        except Exception as e:
+            self.call_from_thread(self._transcription_error, str(e))
+        finally:
+            self._transcribing = False
+            # Clean up temp recording
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _show_transcribe_progress(self) -> None:
+        pb = self.query_one("#progress", ProgressBar)
+        pb.add_class("visible")
+        pb.update(progress=50, total=100)
+
+    def _transcription_done(self, result) -> None:
+        pb = self.query_one("#progress", ProgressBar)
+        pb.remove_class("visible")
+        self.query_one("#btn-generate", Button).disabled = False
+
+        ta = self.query_one("#text-input", TextArea)
+        existing = ta.text.strip()
+        if existing:
+            ta.load_text(existing + "\n\n" + result.text)
+        else:
+            ta.load_text(result.text)
+
+        mins, secs = divmod(result.duration_s, 60)
+        self._set_status(
+            f"Transcribed {int(mins)}m{int(secs):02d}s audio via {result.provider} — "
+            f"{len(result.text)} chars, {len(result.segments)} segments"
+        )
+        self.sub_title = "Text-to-Speech"
+        self._update_cost()
+
+    def _transcription_error(self, error: str) -> None:
+        pb = self.query_one("#progress", ProgressBar)
+        pb.remove_class("visible")
+        self.query_one("#btn-generate", Button).disabled = False
+        self._set_status(f"Transcription error: {error}")
+        self.sub_title = "Text-to-Speech"
 
     def action_play_last(self) -> None:
         if self._history:
