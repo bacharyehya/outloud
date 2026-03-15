@@ -13,7 +13,7 @@ import aiohttp
 
 from . import AudioResult, CostEstimate, TTSProvider, Voice, chunk_text, get_duration, concat_chunks, cleanup_tmpdir
 
-MAX_CONCURRENT = 8
+MAX_CONCURRENT = 4
 REQUEST_TIMEOUT = 60  # seconds per chunk
 API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
@@ -59,8 +59,10 @@ def _pcm_to_wav(pcm_path: str, wav_path: str):
         raise RuntimeError(f"PCM→WAV failed: {result.stderr.decode()[-200:]}")
 
 
-async def _tts_chunk(session, semaphore, api_key, text, out_path, voice, model, style="", max_retries=3):
+async def _tts_chunk(session, semaphore, api_key, text, out_path, voice, model, style="", max_retries=6):
     """Generate a single TTS chunk. Returns (success: bool, error: str)."""
+    import random
+
     if style:
         styled_text = f"[{style}]\n\n{text}"
     else:
@@ -112,7 +114,10 @@ async def _tts_chunk(session, semaphore, api_key, text, out_path, voice, model, 
             except Exception as e:
                 return False, f"unexpected: {e}"
         if attempt < max_retries:
-            await asyncio.sleep(min(1.0 * attempt, 3.0))
+            # Exponential backoff with jitter — 429s need patience
+            base_delay = min(2.0 ** attempt, 15.0)
+            jitter = random.uniform(0, base_delay * 0.5)
+            await asyncio.sleep(base_delay + jitter)
     return False, f"failed after {max_retries} retries: {last_error}"
 
 
@@ -176,7 +181,7 @@ class GeminiProvider(TTSProvider):
                 async with aiohttp.ClientSession() as session:
                     tasks = []
                     for i, (chunk, path) in enumerate(zip(chunks, chunk_files)):
-                        tasks.append(self._gen_with_progress(session, semaphore, api_key, chunk, path, voice, i, total, on_progress, style=style))
+                        tasks.append(self._gen_with_progress(session, semaphore, api_key, chunk, path, voice, i, total, on_progress, style=style, delay=i * 0.15))
                     results = await asyncio.gather(*tasks)
 
                 ok_files = [f for f, (ok, _) in zip(chunk_files, results) if ok and os.path.isfile(f)]
@@ -211,7 +216,9 @@ class GeminiProvider(TTSProvider):
             provider=self.name, voice=voice, elapsed_s=round(elapsed, 1),
         )
 
-    async def _gen_with_progress(self, session, semaphore, api_key, chunk, path, voice, idx, total, on_progress, style=""):
+    async def _gen_with_progress(self, session, semaphore, api_key, chunk, path, voice, idx, total, on_progress, style="", delay=0):
+        if delay > 0:
+            await asyncio.sleep(delay)
         ok, err = await _tts_chunk(session, semaphore, api_key, chunk, path, voice, self.model, style=style)
         if on_progress:
             on_progress(idx, total, ok, err)
