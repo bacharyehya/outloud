@@ -125,7 +125,10 @@ class OpenAIProvider(TTSProvider):
             cost = len(text) / 1_000_000 * model_info["per_m_chars"]
         else:
             input_tokens = len(text) / 4
-            output_tokens = len(chunks) * 400
+            # Estimate audio duration: ~1400 chars/min TTS speech rate (calibrated from real usage)
+            # Audio output tokens: ~30 tokens/second (conservative estimate)
+            estimated_seconds = len(text) / 1400 * 60
+            output_tokens = estimated_seconds * 30
             cost = (input_tokens / 1_000_000 * model_info["input_per_m_tokens"] +
                     output_tokens / 1_000_000 * model_info["output_per_m_tokens"])
         return CostEstimate(provider=self.name, chars=len(text), chunks=len(chunks), estimated_usd=cost)

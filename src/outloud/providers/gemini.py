@@ -146,7 +146,10 @@ class GeminiProvider(TTSProvider):
     def estimate_cost(self, text: str) -> CostEstimate:
         chunks = chunk_text(text)
         input_tokens = len(text) / 4
-        output_tokens = len(chunks) * 400
+        # Estimate audio duration: ~1400 chars/min TTS speech rate (calibrated from real usage)
+        # Audio output tokens: ~30 tokens/second (conservative estimate)
+        estimated_seconds = len(text) / 1400 * 60
+        output_tokens = estimated_seconds * 30
         pricing = MODELS.get(self.model, MODELS[DEFAULT_MODEL])
         cost = (input_tokens / 1_000_000 * pricing["input_per_m"] +
                 output_tokens / 1_000_000 * pricing["output_per_m"])
