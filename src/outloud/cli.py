@@ -7,6 +7,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 
 from . import __version__
 from .stt import is_audio_file, TranscriptResult
@@ -281,20 +282,30 @@ def main():
 
         print(f"{len(text):,} chars -> {est.chunks} chunk{'s' if est.chunks != 1 else ''} via {provider.name} — {est.display}")
 
-        def on_progress(idx, total, success):
-            status = "done" if success else "FAILED"
-            print(f"  Chunk {idx+1}/{total} {status}")
+        t0 = time.monotonic()
+        failures = 0
+
+        def on_progress(idx, total, success, error=""):
+            nonlocal failures
+            elapsed = time.monotonic() - t0
+            if success:
+                print(f"  Chunk {idx+1}/{total} done ({elapsed:.0f}s)")
+            else:
+                failures += 1
+                reason = f": {error}" if error else ""
+                print(f"  Chunk {idx+1}/{total} FAILED{reason} ({elapsed:.0f}s)")
 
         result = asyncio.run(provider.generate(
             text=text, voice=voice, style=style, speed=args.speed, on_progress=on_progress,
         ))
 
         if not result:
-            print("Generation failed.", file=sys.stderr)
+            print("Generation failed — all chunks failed. Check your API key and network.", file=sys.stderr)
             sys.exit(1)
 
         mins, secs = divmod(result.duration_s, 60)
-        print(f"Saved: {result.path} ({result.size_kb:,}KB, {mins}m{secs:02d}s)")
+        fail_str = f", {result.chunks_failed} failed" if result.chunks_failed else ""
+        print(f"Saved: {result.path} ({result.size_kb:,}KB, {mins}m{secs:02d}s, {result.elapsed_s}s elapsed{fail_str})")
 
         if args.play:
             from .audio import play_audio

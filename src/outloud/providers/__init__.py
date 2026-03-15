@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -34,8 +35,10 @@ class AudioResult:
     size_kb: int
     duration_s: int
     chunks: int
+    chunks_failed: int
     provider: str
     voice: str
+    elapsed_s: float
 
 
 class TTSProvider(ABC):
@@ -74,6 +77,69 @@ class TTSProvider(ABC):
     def default_voice(self) -> str:
         v = self.voices()
         return v[0].id if v else ""
+
+
+# -- Shared utilities --
+
+def chunk_text(text: str, limit: int = 2000) -> list[str]:
+    """Split text into chunks at sentence/paragraph boundaries. Filters empty chunks."""
+    if len(text) <= limit:
+        return [text]
+    chunks, remaining = [], text
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        cut = limit
+        for sep in [". ", "! ", "? ", "\n\n", "\n", ", ", " "]:
+            idx = remaining[:limit].rfind(sep)
+            if idx > 0:
+                cut = idx + len(sep)
+                break
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:]
+    return [c for c in chunks if c.strip()]
+
+
+def get_duration(path: str) -> int:
+    """Get audio duration in seconds via ffprobe."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=10)
+        return int(float(r.stdout.strip() or "0"))
+    except Exception:
+        return 0
+
+
+def concat_chunks(ok_files: list[str], out_file: str, tmpdir: str):
+    """Concatenate WAV chunks with audio normalization."""
+    list_file = os.path.join(tmpdir, "list.txt")
+    with open(list_file, "w") as f:
+        for cf in ok_files:
+            f.write(f"file '{cf}'\n")
+    result = subprocess.run([
+        "ffmpeg", "-f", "concat", "-safe", "0", "-i", list_file,
+        "-af", "dynaudnorm=p=0.9:s=5",
+        "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le",
+        out_file, "-y",
+    ], capture_output=True, timeout=120)
+    os.remove(list_file)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg concat failed: {result.stderr.decode()[-200:]}")
+
+
+def cleanup_tmpdir(tmpdir: str, chunk_files: list[str]):
+    """Remove temporary chunk files and directory."""
+    for cf in chunk_files:
+        try:
+            os.remove(cf)
+        except FileNotFoundError:
+            pass
+    try:
+        os.rmdir(tmpdir)
+    except OSError:
+        pass
 
 
 class ProviderManager:

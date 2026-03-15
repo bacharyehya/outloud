@@ -1,3 +1,3 @@
 """outloud — Beautiful TUI for text-to-speech. Local or cloud. One command."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

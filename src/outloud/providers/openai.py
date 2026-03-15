@@ -10,10 +10,11 @@ import time
 
 import aiohttp
 
-from . import AudioResult, CostEstimate, TTSProvider, Voice
+from . import AudioResult, CostEstimate, TTSProvider, Voice, chunk_text, get_duration, concat_chunks, cleanup_tmpdir
 
 CHAR_LIMIT = 4096
-MAX_CONCURRENT = 4
+MAX_CONCURRENT = 8
+REQUEST_TIMEOUT = 60
 API_URL = "https://api.openai.com/v1/audio/speech"
 
 MODELS = {
@@ -31,7 +32,6 @@ VOICES = [
     Voice("marin", "Marin"), Voice("cedar", "Cedar"),
 ]
 
-# Only these work with tts-1 / tts-1-hd
 TTS1_VOICES = {"alloy", "ash", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"}
 
 STYLE_PRESETS = {
@@ -45,26 +45,8 @@ STYLE_PRESETS = {
 }
 
 
-def _chunk_text(text: str, limit: int = CHAR_LIMIT) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-    chunks, remaining = [], text
-    while remaining:
-        if len(remaining) <= limit:
-            chunks.append(remaining)
-            break
-        cut = limit
-        for sep in [". ", "! ", "? ", "\n\n", "\n", ", ", " "]:
-            idx = remaining[:limit].rfind(sep)
-            if idx > 0:
-                cut = idx + len(sep)
-                break
-        chunks.append(remaining[:cut])
-        remaining = remaining[cut:]
-    return chunks
-
-
 async def _tts_chunk(session, semaphore, api_key, text, out_path, voice, model, style="", speed=1.0, max_retries=3):
+    """Generate a single TTS chunk. Returns (success: bool, error: str)."""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": model,
@@ -78,25 +60,36 @@ async def _tts_chunk(session, semaphore, api_key, text, out_path, voice, model, 
     if not model_info.get("supports_instructions") and speed != 1.0:
         payload["speed"] = max(0.25, min(4.0, speed))
 
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    last_error = ""
+
     for attempt in range(1, max_retries + 1):
         async with semaphore:
             try:
-                async with session.post(API_URL, headers=headers, json=payload) as resp:
-                    if resp.status == 429 or resp.status >= 500:
-                        pass
+                async with session.post(API_URL, headers=headers, json=payload, timeout=timeout) as resp:
+                    if resp.status == 429:
+                        last_error = "rate limited"
+                    elif resp.status >= 500:
+                        last_error = f"server error {resp.status}"
                     elif resp.status != 200:
-                        return False
+                        body = await resp.text()
+                        return False, f"HTTP {resp.status}: {body[:150]}"
                     else:
                         data = await resp.read()
+                        if len(data) < 100:
+                            return False, "empty audio response"
                         with open(out_path, "wb") as f:
                             f.write(data)
-                        return True
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                pass
-            except Exception:
-                return False
-        await asyncio.sleep(2 ** attempt)
-    return False
+                        return True, ""
+            except asyncio.TimeoutError:
+                last_error = f"timeout ({REQUEST_TIMEOUT}s)"
+            except aiohttp.ClientError as e:
+                last_error = f"connection error: {e}"
+            except Exception as e:
+                return False, f"unexpected: {e}"
+        if attempt < max_retries:
+            await asyncio.sleep(min(1.0 * attempt, 3.0))
+    return False, f"failed after {max_retries} retries: {last_error}"
 
 
 class OpenAIProvider(TTSProvider):
@@ -126,7 +119,7 @@ class OpenAIProvider(TTSProvider):
         return "coral"
 
     def estimate_cost(self, text: str) -> CostEstimate:
-        chunks = _chunk_text(text)
+        chunks = chunk_text(text, CHAR_LIMIT)
         model_info = MODELS.get(self.model, MODELS[DEFAULT_MODEL])
         if "per_m_chars" in model_info:
             cost = len(text) / 1_000_000 * model_info["per_m_chars"]
@@ -142,68 +135,56 @@ class OpenAIProvider(TTSProvider):
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY not set")
 
-        chunks = _chunk_text(text)
+        t0 = time.monotonic()
+        chunks = chunk_text(text, CHAR_LIMIT)
         total = len(chunks)
         output_dir = output_dir or os.path.expanduser("~/Downloads")
         os.makedirs(output_dir, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         out_file = os.path.join(output_dir, f"outloud_{ts}.wav")
         semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+        failed_count = 0
 
         if total == 1:
             async with aiohttp.ClientSession() as session:
-                ok = await _tts_chunk(session, semaphore, api_key, chunks[0], out_file, voice, self.model, style, speed)
+                ok, err = await _tts_chunk(session, semaphore, api_key, chunks[0], out_file, voice, self.model, style, speed)
                 if on_progress:
-                    on_progress(0, 1, ok)
+                    on_progress(0, 1, ok, err)
                 if not ok:
                     return None
         else:
             tmpdir = tempfile.mkdtemp()
             chunk_files = [os.path.join(tmpdir, f"chunk_{i:03d}.wav") for i in range(total)]
-            async with aiohttp.ClientSession() as session:
-                tasks = []
-                for i, (chunk, path) in enumerate(zip(chunks, chunk_files)):
-                    tasks.append(self._gen_with_progress(session, semaphore, api_key, chunk, path, voice, style, speed, i, total, on_progress))
-                results = await asyncio.gather(*tasks)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    tasks = []
+                    for i, (chunk, path) in enumerate(zip(chunks, chunk_files)):
+                        tasks.append(self._gen_with_progress(session, semaphore, api_key, chunk, path, voice, style, speed, i, total, on_progress))
+                    results = await asyncio.gather(*tasks)
 
-            ok_files = [f for f, ok in zip(chunk_files, results) if ok and os.path.isfile(f)]
-            if not ok_files:
-                self._cleanup(tmpdir, chunk_files)
-                return None
+                ok_files = [f for f, (ok, _) in zip(chunk_files, results) if ok and os.path.isfile(f)]
+                failed_count = sum(1 for _, (ok, _) in zip(chunk_files, results) if not ok)
 
-            list_file = os.path.join(tmpdir, "list.txt")
-            with open(list_file, "w") as f:
-                for cf in ok_files:
-                    f.write(f"file '{cf}'\n")
-            subprocess.run(["ffmpeg", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", out_file, "-y"], capture_output=True)
-            self._cleanup(tmpdir, chunk_files, list_file)
+                if not ok_files:
+                    return None
+
+                concat_chunks(ok_files, out_file, tmpdir)
+            finally:
+                cleanup_tmpdir(tmpdir, chunk_files)
+
+        elapsed = time.monotonic() - t0
+        if not os.path.isfile(out_file):
+            return None
 
         return AudioResult(
             path=out_file, size_kb=os.path.getsize(out_file) // 1024,
-            duration_s=self._get_duration(out_file), chunks=total,
-            provider=self.name, voice=voice,
+            duration_s=get_duration(out_file), chunks=total,
+            chunks_failed=failed_count,
+            provider=self.name, voice=voice, elapsed_s=round(elapsed, 1),
         )
 
     async def _gen_with_progress(self, session, semaphore, api_key, chunk, path, voice, style, speed, idx, total, on_progress):
-        ok = await _tts_chunk(session, semaphore, api_key, chunk, path, voice, self.model, style, speed)
+        ok, err = await _tts_chunk(session, semaphore, api_key, chunk, path, voice, self.model, style, speed)
         if on_progress:
-            on_progress(idx, total, ok)
-        return ok
-
-    def _cleanup(self, tmpdir, chunk_files, list_file=None):
-        for cf in chunk_files:
-            if os.path.isfile(cf):
-                os.remove(cf)
-        if list_file and os.path.isfile(list_file):
-            os.remove(list_file)
-        if os.path.isdir(tmpdir):
-            os.rmdir(tmpdir)
-
-    def _get_duration(self, path: str) -> int:
-        try:
-            r = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
-                capture_output=True, text=True)
-            return int(float(r.stdout.strip() or "0"))
-        except Exception:
-            return 0
+            on_progress(idx, total, ok, err)
+        return ok, err

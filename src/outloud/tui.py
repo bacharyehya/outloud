@@ -365,6 +365,8 @@ class OutloudApp(App):
         import asyncio
 
         self._generating = True
+        self._gen_start = time.monotonic()
+        self._gen_failures = 0
         style_name = self.app.query_one("#style-select", Select).value
         style = provider.styles().get(style_name, "") if style_name else ""
 
@@ -374,11 +376,17 @@ class OutloudApp(App):
 
         self.call_from_thread(self._show_progress, len(text), est.chunks, provider.name, est.display)
 
-        def on_progress(idx, total, success):
+        def on_progress(idx, total, success, error=""):
             self._chunks_done += 1
+            if not success:
+                self._gen_failures += 1
             pct = int(self._chunks_done / max(self._chunks_total, 1) * 100)
-            status = "ok" if success else "FAILED"
-            self.call_from_thread(self._update_progress, pct, idx + 1, total, status)
+            elapsed = time.monotonic() - self._gen_start
+            if success:
+                status = "ok"
+            else:
+                status = f"FAILED: {error}" if error else "FAILED"
+            self.call_from_thread(self._update_progress, pct, idx + 1, total, status, elapsed)
 
         loop = asyncio.new_event_loop()
         try:
@@ -398,7 +406,7 @@ class OutloudApp(App):
             self._config.save()
             self.call_from_thread(self._generation_done, result)
         else:
-            self.call_from_thread(self._generation_error, "Generation failed")
+            self.call_from_thread(self._generation_error, "All chunks failed — check your API key and network")
 
     def _show_progress(self, chars: int, chunks: int, provider: str, cost: str) -> None:
         pb = self.query_one("#progress", ProgressBar)
@@ -407,10 +415,18 @@ class OutloudApp(App):
         self._set_status(f"Generating via {provider}... {chars:,} chars, {chunks} chunk{'s' if chunks != 1 else ''} — {cost}")
         self.query_one("#btn-generate", Button).disabled = True
 
-    def _update_progress(self, pct: int, chunk_idx: int, total: int, status: str) -> None:
+    def _update_progress(self, pct: int, chunk_idx: int, total: int, status: str, elapsed: float) -> None:
         pb = self.query_one("#progress", ProgressBar)
         pb.update(progress=pct, total=100)
-        self._set_status(f"Chunk {chunk_idx}/{total} {status} ({pct}%)")
+        elapsed_str = f"{elapsed:.0f}s"
+        # ETA: time so far / chunks done * chunks remaining
+        if self._chunks_done > 0:
+            eta = (elapsed / self._chunks_done) * (total - self._chunks_done)
+            eta_str = f"~{eta:.0f}s left"
+        else:
+            eta_str = ""
+        fail_str = f" ({self._gen_failures} failed)" if self._gen_failures else ""
+        self._set_status(f"Chunk {chunk_idx}/{total} {status} — {elapsed_str} elapsed{', ' + eta_str if eta_str else ''}{fail_str}")
 
     def _generation_done(self, result) -> None:
         pb = self.query_one("#progress", ProgressBar)
@@ -418,7 +434,11 @@ class OutloudApp(App):
         self.query_one("#btn-generate", Button).disabled = False
 
         mins, secs = divmod(result.duration_s, 60)
-        self._set_status(f"Done! {result.size_kb:,}KB, {mins}m{secs:02d}s via {result.provider} — {result.path}")
+        fail_str = f", {result.chunks_failed} failed" if result.chunks_failed else ""
+        self._set_status(
+            f"Done in {result.elapsed_s}s! {result.size_kb:,}KB, {mins}m{secs:02d}s audio, "
+            f"{result.chunks} chunks{fail_str} via {result.provider} — {result.path}"
+        )
 
         history = self.query_one("#history-list", OptionList)
         fname = Path(result.path).name
